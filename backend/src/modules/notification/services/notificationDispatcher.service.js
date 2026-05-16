@@ -1,7 +1,7 @@
-const emailService = require('../../email/services/email.service');
-const socketConfig = require('../../../common/config/socket');
 const User = require('../../user/models/user.model');
 const Task = require('../../task/models/task.model');
+const Column = require('../../column/models/column.model'); 
+const notificationService = require('./notification.service'); 
 
 // ==========================================
 // 💡 BASE TEMPLATE (100% ENGLISH)
@@ -21,27 +21,34 @@ const getBaseTemplate = (color, title, bodyContent) => `
 </div>
 `;
 
-// Helper dispatch
-const dispatch = async (userId, title, message, emailHtml) => {
-    const user = await User.findById(userId).select('email full_name').lean();
-    if (!user) return;
+const dispatch = async (userId, title, message, emailHtml, type = 'SYSTEM', referenceId = null) => {
+    if (!userId) return; 
 
-    const io = socketConfig.getIo();
-    io.to(userId.toString()).emit('system_notification', { title, message });
-
-    if (emailHtml) {
-        emailService.sendEmail(user.email, title, emailHtml).catch(err => console.error('Email Error:', err));
-    }
+    await notificationService.queueNotification({
+        recipient_id: userId,
+        title: title,
+        message: message,
+        type: type,
+        reference_id: referenceId,
+        email_html: emailHtml 
+    });
 };
 
 // ==========================================
 // 1. EXTENSION REQUEST (Manager & Employee)
 // ==========================================
 exports.dispatchExtensionRequest = async (payload) => {
-    const task = await Task.findById(payload.taskId).lean();
-    const managerId = task.board_id; 
+    const task = await Task.findById(payload.taskId).populate({
+        path: 'board_id',
+        populate: { path: 'project_id' }
+    }).lean();
     
-    // 📩 TO MANAGER (Orange - Warning)
+    // Tạm thời comment tìm owner thật để chạy Demo cho nhanh
+    // let managerId = task?.board_id?.project_id?.owner_id || task?.board_id?.project_id?.created_by;
+
+    // Ép cứng gửi cho System Admin
+    let managerId = "69d077d868bb004168dc3500"; 
+    
     const managerHtml = getBaseTemplate('#F59E0B', 'New Extension Request', `
         <p>Dear Manager,</p>
         <p>An employee has submitted a deadline extension request for the following task:</p>
@@ -53,9 +60,8 @@ exports.dispatchExtensionRequest = async (payload) => {
         </div>
         <p>Please log in to the system to Approve or Reject this request.</p>
     `);
-    await dispatch(managerId, 'New Extension Request', `Employee requested a deadline extension for Task: ${task.title}`, managerHtml);
+    await dispatch(managerId, 'New Extension Request', `Employee requested a deadline extension for Task: ${task.title}`, managerHtml, 'EXTENSION_REQUEST', task._id);
 
-    // 📩 TO EMPLOYEE - Confirmation (Blue)
     const employeeHtml = getBaseTemplate('#3B82F6', 'Request Submitted', `
         <p>Hi,</p>
         <p>The system has recorded your deadline extension request and forwarded it to the Project Manager.</p>
@@ -65,7 +71,7 @@ exports.dispatchExtensionRequest = async (payload) => {
         </div>
         <p>While waiting for approval, your original deadline remains unchanged. Please check your email for the result.</p>
     `);
-    await dispatch(payload.userId, 'Extension Request Submitted', `You have submitted a deadline extension request for Task: ${task.title}`, employeeHtml);
+    await dispatch(payload.userId, 'Extension Request Submitted', `You have submitted a deadline extension request for Task: ${task.title}`, employeeHtml, 'EXTENSION_REQUEST', task._id);
 };
 
 // ==========================================
@@ -73,8 +79,8 @@ exports.dispatchExtensionRequest = async (payload) => {
 // ==========================================
 exports.dispatchExtensionApproved = async (payload) => {
     const task = await Task.findById(payload.taskId).lean();
+    if (!task || !task.assignee_id) return;
     
-    // 📩 APPROVED (Green)
     const html = getBaseTemplate('#10B981', 'Request Approved ✅', `
         <p>Good news,</p>
         <p>The Project Manager has <b>approved</b> your deadline extension request.</p>
@@ -84,8 +90,7 @@ exports.dispatchExtensionApproved = async (payload) => {
         </div>
         <p>Wishing you success in completing your work with this new timeline!</p>
     `);
-                  
-    await dispatch(task.assignee_id, 'Extension Approved', `Manager has approved the deadline extension for Task: ${task.title}`, html);
+    await dispatch(task.assignee_id, 'Extension Approved', `Manager has approved the deadline extension for Task: ${task.title}`, html, 'EXTENSION_APPROVE', task._id);
 };
 
 // ==========================================
@@ -93,8 +98,8 @@ exports.dispatchExtensionApproved = async (payload) => {
 // ==========================================
 exports.dispatchExtensionRejected = async (payload) => {
     const task = await Task.findById(payload.taskId).lean();
+    if (!task || !task.assignee_id) return;
     
-    // 📩 REJECTED (Red)
     const html = getBaseTemplate('#EF4444', 'Request Rejected ❌', `
         <p>Hi,</p>
         <p>The Project Manager has reviewed but <b>rejected</b> your deadline extension request.</p>
@@ -108,6 +113,46 @@ exports.dispatchExtensionRejected = async (payload) => {
             </p>
         </div>
     `);
-                  
-    await dispatch(task.assignee_id, 'Extension Rejected', `Manager has rejected the deadline extension for Task: ${task.title}`, html);
+    await dispatch(task.assignee_id, 'Extension Rejected', `Manager has rejected the deadline extension for Task: ${task.title}`, html, 'EXTENSION_REJECT', task._id);
+};
+
+// ==========================================
+// 4. THÊM MỚI: TASK UPDATED (To Assignee)
+// ==========================================
+exports.dispatchTaskUpdated = async (payload) => {
+    const task = await Task.findById(payload.taskId).lean();
+    if (!task || !task.assignee_id) return; 
+
+    const html = getBaseTemplate('#6366F1', 'Task Updated 📝', `
+        <p>Hi,</p>
+        <p>There have been some updates to a task assigned to you.</p>
+        <div style="background-color: #EEF2FF; padding: 15px; border-left: 4px solid #4F46E5; margin: 20px 0; border-radius: 4px;">
+            <p style="margin: 0; color: #3730A3;"><strong>Task:</strong> ${task.title}</p>
+        </div>
+        <p>Please log in to the system to check the latest details.</p>
+    `);
+    await dispatch(task.assignee_id, 'Task Updated', `Task details have been updated: ${task.title}`, html, 'TASK_UPDATE', task._id);
+};
+
+// ==========================================
+// 5. THÊM MỚI: TASK MOVED / DRAG & DROP (To Assignee)
+// ==========================================
+exports.dispatchTaskMoved = async (payload) => {
+    const task = await Task.findById(payload.taskId).lean();
+    if (!task || !task.assignee_id) return;
+
+    // Lấy tên cột mới
+    const column = await Column.findById(payload.destColumnId).lean();
+    const colName = column ? column.title : 'another column';
+
+    const html = getBaseTemplate('#8B5CF6', 'Task Status Changed 🚀', `
+        <p>Hi,</p>
+        <p>A task assigned to you has been moved to a new stage.</p>
+        <div style="background-color: #F5F3FF; padding: 15px; border-left: 4px solid #7C3AED; margin: 20px 0; border-radius: 4px;">
+            <p style="margin: 0; color: #5B21B6;"><strong>Task:</strong> ${task.title}</p>
+            <p style="margin: 10px 0 0 0; color: #5B21B6;"><strong>New Status:</strong> ${colName}</p>
+        </div>
+        <p>Keep up the great work!</p>
+    `);
+    await dispatch(task.assignee_id, 'Task Status Changed', `Task moved to ${colName}: ${task.title}`, html, 'TASK_MOVE', task._id);
 };
